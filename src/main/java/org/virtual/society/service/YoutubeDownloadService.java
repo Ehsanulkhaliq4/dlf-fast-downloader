@@ -1,6 +1,7 @@
 package org.virtual.society.service;
 
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
 import org.virtual.society.exceptions.DownloadException;
 import org.virtual.society.model.VideoFormat;
 import org.virtual.society.model.VideoInfo;
@@ -24,6 +25,10 @@ public class YoutubeDownloadService {
     private static final String DOWNLOAD_DIR = System.getProperty("user.dir") + "/downloads/";
     private static final String YT_DLP_COMMAND = "yt-dlp";
     private static final long PROCESS_TIMEOUT = 30;
+
+    @Inject
+    DownloadProgressService progressService;
+
     // Main Download Method Get Details and every thing
     public VideoInfo getVideoInfo(String videoUrl){
         try{
@@ -38,68 +43,92 @@ public class YoutubeDownloadService {
         }
     }
     //Download the file method
-    public File downloadVideo(String videoUrl , String formatId){
+    public File downloadVideo(String videoUrl , String formatId, String downloadId){
         try {
+            progressService.updateProgress(downloadId, "starting", 0, "Extracting video ID");
             String videoId = extractVideoId(videoUrl);
             if (videoId == null){
+                progressService.updateProgress(downloadId, "error", 0, "Invalid YouTube URL");
                 throw new DownloadException("Invalid YouTube URL");
             }
+            progressService.updateProgress(downloadId, "downloading", 10, "Creating download directory");
             //Create Directory if not exist
             Path downloadPath = Paths.get(DOWNLOAD_DIR);
             if (!Files.exists(downloadPath)){
                 Files.createDirectories(downloadPath);
             }
-            // Set output template
-            String outputTemplate = DOWNLOAD_DIR + "%(title)s.%(ext)s";
-
-            // Build yt-dlp command
-            ProcessBuilder processBuilder;
-            if ("best".equals(formatId)) {
-                processBuilder = new ProcessBuilder(
-                        YT_DLP_COMMAND,
-                        "-f", "best",
-                        "-o", outputTemplate,
-                        videoUrl
-                );
-            } else {
-                processBuilder = new ProcessBuilder(
-                        YT_DLP_COMMAND,
-                        "-f", formatId,
-                        "-o", outputTemplate,
-                        videoUrl
-                );
+            // Build yt-dlp command with specific format and output template
+            List<String> command = new ArrayList<>();
+            command.add(YT_DLP_COMMAND);
+            // Add format specification
+            if (formatId != null && !formatId.isEmpty() && !"best".equals(formatId)) {
+                command.add("-f");
+                command.add(formatId);
             }
+            // Add output template with safe filename
+            command.add("-o");
+            command.add(DOWNLOAD_DIR + "%(title)s [%(id)s].%(ext)s");
+            // Add other options to ensure proper video download
+            command.add("--no-playlist");
+            command.add("--merge-output-format");
+            command.add("mp4");
+            command.add("--no-mtime");
+            command.add("--no-overwrites");
+            command.add("--continue");
+            // Add the video URL
+            command.add(videoUrl);
+            ProcessBuilder processBuilder = new ProcessBuilder(command);
             // Redirect error stream to output stream
             processBuilder.redirectErrorStream(true);
+            progressService.updateProgress(downloadId, "downloading", 20, "Starting download process");
             Process process = processBuilder.start();
-
             // Read output
             BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
             StringBuilder output = new StringBuilder();
             String line;
             while ((line = reader.readLine()) != null) {
                 output.append(line).append("\n");
+                System.out.println("yt-dlp: " + line); // Log output for debugging
+                int progress = parseProgressFromOutput(line);
+                if (progress >= 0) {
+                    progressService.updateProgress(downloadId, "downloading", progress, "Downloading video");
+                }
+                if (line.contains("[Merger]")) {
+                    progressService.updateProgress(downloadId, "converting", 90, "Merging formats");
+                }
             }
-
             boolean finished = process.waitFor(PROCESS_TIMEOUT, TimeUnit.SECONDS);
-
             if (!finished) {
                 process.destroy();
-                throw new DownloadException("Download timed out");
+                throw new DownloadException("Download timed out after " + PROCESS_TIMEOUT + " seconds");
             }
             if (process.exitValue() != 0) {
+                progressService.updateProgress(downloadId, "error", 0, "Download failed");
                 throw new DownloadException("Download failed: " + output.toString());
             }
 
+            progressService.updateProgress(downloadId, "completed", 100, "Download completed successfully");
             // Extract downloaded filename from output
             String filename = extractDownloadedFilename(output.toString());
             if (filename != null) {
-                return new File(filename);
+                File downloadedFile = new File(filename);
+                if (downloadedFile.exists() && downloadedFile.length() > 0) {
+                    return downloadedFile;
+                } else {
+                    throw new DownloadException("Downloaded file doesn't exist or is empty: " + filename);
+                }
             } else {
                 // Fallback: look for the most recently created file in download directory
-                return findLatestFile(downloadPath.toFile());
+                File latestFile = findLatestFile(downloadPath.toFile());
+                if (latestFile != null && latestFile.exists() && latestFile.length() > 0) {
+                    return latestFile;
+                } else {
+                    throw new DownloadException("Could not find downloaded file. yt-dlp output: " + output.toString());
+                }
             }
         }catch (IOException | InterruptedException e) {
+            progressService.updateProgress(downloadId, "error", 0, "Download error: " + e.getMessage());
+            Thread.currentThread().interrupt();
             throw new DownloadException("Failed to download video", e);
         }
     }
@@ -339,6 +368,92 @@ public class YoutubeDownloadService {
             return finished && process.exitValue() == 0;
         }catch (IOException | InterruptedException e) {
             return false;
+        }
+    }
+
+    private int parseProgressFromOutput(String line) {
+        if (line == null || line.trim().isEmpty()) {
+            return -1;
+        }
+
+        try {
+            // Check for common completion indicators first
+            if (line.contains("100%") ||
+                    line.contains("Download completed") ||
+                    line.contains("already been downloaded")) {
+                return 100;
+            }
+
+            // Pattern 1: Standard progress percentage [download]  12.5% of 10.01MiB
+            Pattern percentagePattern = Pattern.compile("\\[download\\].*?(\\d+\\.?\\d*)%");
+            Matcher percentageMatcher = percentagePattern.matcher(line);
+            if (percentageMatcher.find()) {
+                float progress = Float.parseFloat(percentageMatcher.group(1));
+                return Math.min(100, Math.max(0, (int) progress));
+            }
+
+            // Pattern 2: Fractional progress [download] Downloading item 3 of 5
+            Pattern fractionPattern = Pattern.compile("\\[download\\].*?(\\d+)\\s+of\\s+(\\d+)");
+            Matcher fractionMatcher = fractionPattern.matcher(line);
+            if (fractionMatcher.find()) {
+                int current = Integer.parseInt(fractionMatcher.group(1));
+                int total = Integer.parseInt(fractionMatcher.group(2));
+                if (total > 0 && current <= total) {
+                    return (int) ((current * 100.0) / total);
+                }
+            }
+
+            // Pattern 3: File size progress [download]  5.2MiB of 10.1MiB
+            Pattern sizePattern = Pattern.compile("\\[download\\].*?(\\d+\\.?\\d*)([KMG]?i?B)\\s+of\\s+(\\d+\\.?\\d*)([KMG]?i?B)");
+            Matcher sizeMatcher = sizePattern.matcher(line);
+            if (sizeMatcher.find()) {
+                double currentSize = parseSize(sizeMatcher.group(1), sizeMatcher.group(2));
+                double totalSize = parseSize(sizeMatcher.group(3), sizeMatcher.group(4));
+                if (totalSize > 0) {
+                    int progress = (int) ((currentSize * 100.0) / totalSize);
+                    return Math.min(100, progress);
+                }
+            }
+
+            // Pattern 4: Processing stages
+            if (line.contains("[Merger]")) {
+                return 90; // Merging formats
+            }
+            if (line.contains("[ExtractAudio]")) {
+                return 95; // Extracting audio
+            }
+            if (line.contains("[Metadata]")) {
+                return 97; // Adding metadata
+            }
+            if (line.contains("[info]")) {
+                return 99; // Final info messages
+            }
+
+            // Pattern 5: Error messages
+            if (line.contains("ERROR") || line.contains("error") || line.contains("failed")) {
+                return -2; // Special value to indicate error
+            }
+
+        } catch (Exception e) {
+            System.err.println("Error parsing progress from line: " + line + " - " + e.getMessage());
+        }
+
+        return -1;
+    }
+
+    // Helper method to parse size strings like "10.5MiB", "2.3GB", "512KiB"
+    private double parseSize(String value, String unit) {
+        try {
+            double size = Double.parseDouble(value);
+            switch (unit.toUpperCase()) {
+                case "B": return size;
+                case "KB": case "KIB": return size * 1024;
+                case "MB": case "MIB": return size * 1024 * 1024;
+                case "GB": case "GIB": return size * 1024 * 1024 * 1024;
+                default: return size;
+            }
+        } catch (NumberFormatException e) {
+            return 0;
         }
     }
 }
