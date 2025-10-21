@@ -1,8 +1,11 @@
 package org.virtual.society.service;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.virtual.society.exceptions.DownloadException;
+import org.virtual.society.model.DownloadProgress;
 import org.virtual.society.model.VideoFormat;
 import org.virtual.society.model.VideoInfo;
 
@@ -15,6 +18,10 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -25,33 +32,74 @@ public class YoutubeDownloadService {
     private static final String DOWNLOAD_DIR = System.getProperty("user.dir") + "/downloads/";
     private static final String YT_DLP_COMMAND = "yt-dlp";
     private static final long PROCESS_TIMEOUT = 30;
+    private static final int MAX_CACHE_SIZE = 100;
+    private final Map<String, VideoInfo> videoInfoCache = new ConcurrentHashMap<>();
 
     @Inject
     DownloadProgressService progressService;
-
     // Main Download Method Get Details and every thing
     public VideoInfo getVideoInfo(String videoUrl){
-        try{
+        if (!isValidYouTubeUrl(videoUrl)) {
+            throw new DownloadException("Invalid YouTube URL: " + videoUrl);
+        }
+        // Use cache with size limit
+        if (videoInfoCache.size() >= MAX_CACHE_SIZE) {
+            videoInfoCache.clear(); // Simple eviction strategy
+        }
+        // Manual cache implementation (avoids recursion)
+        VideoInfo cached = videoInfoCache.get(videoUrl);
+        if (cached != null) {
+            return cached;
+        }
+
+        // Fetch fresh data
+        VideoInfo freshInfo = getVideoInfoDirect(videoUrl);
+        videoInfoCache.put(videoUrl, freshInfo);
+        return freshInfo;
+    }
+    // This is your original method renamed
+    private VideoInfo getVideoInfoDirect(String videoUrl) {
+        try {
             String videoId = extractVideoId(videoUrl);
-            if (videoId == null){
-                throw new DownloadException("Invalid Youtube Url");
+            if (videoId == null) {
+                throw new DownloadException("Invalid YouTube Url - could not extract video ID");
             }
-            // Use yt-dlp to get video information
-            return getVideoInfoWithYtDlp(videoUrl);
-        }catch (Exception e) {
-            throw new DownloadException("Failed to fetch video information", e);
+            VideoInfo result = getVideoInfoWithYtDlp(videoUrl);
+            return result;
+        } catch (Exception e) {
+            throw new DownloadException("Failed to fetch video information: " + e.getMessage(), e);
         }
     }
+    // Validate YouTube URL format
+    private boolean isValidYouTubeUrl(String url) {
+        if (url == null || url.trim().isEmpty()) {
+            return false;
+        }
+        return url.matches("^(https?://)?(www\\.)?(youtube\\.com|youtu\\.?be)/.+$");
+    }
+    //Start Download Method for progress tracking
+    public String startDownload(String videoUrl, String formatId) {
+        String downloadId = UUID.randomUUID().toString();
+
+        // Start download in background thread
+        CompletableFuture.runAsync(() -> {
+            try {
+                downloadVideo(videoUrl, formatId, downloadId);
+            } catch (Exception e) {
+                progressService.updateProgress(downloadId, 0, "ERROR: " + e.getMessage(), "0 KiB/s", "Unknown");
+            }
+        });
+
+        return downloadId;
+    }
+
     //Download the file method
     public File downloadVideo(String videoUrl , String formatId, String downloadId){
         try {
-            progressService.updateProgress(downloadId, "starting", 0, "Extracting video ID");
             String videoId = extractVideoId(videoUrl);
             if (videoId == null){
-                progressService.updateProgress(downloadId, "error", 0, "Invalid YouTube URL");
                 throw new DownloadException("Invalid YouTube URL");
             }
-            progressService.updateProgress(downloadId, "downloading", 10, "Creating download directory");
             //Create Directory if not exist
             Path downloadPath = Paths.get(DOWNLOAD_DIR);
             if (!Files.exists(downloadPath)){
@@ -75,12 +123,12 @@ public class YoutubeDownloadService {
             command.add("--no-mtime");
             command.add("--no-overwrites");
             command.add("--continue");
+            command.add("--newline");
             // Add the video URL
             command.add(videoUrl);
             ProcessBuilder processBuilder = new ProcessBuilder(command);
             // Redirect error stream to output stream
             processBuilder.redirectErrorStream(true);
-            progressService.updateProgress(downloadId, "downloading", 20, "Starting download process");
             Process process = processBuilder.start();
             // Read output
             BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
@@ -88,14 +136,24 @@ public class YoutubeDownloadService {
             String line;
             while ((line = reader.readLine()) != null) {
                 output.append(line).append("\n");
-                System.out.println("yt-dlp: " + line); // Log output for debugging
-                int progress = parseProgressFromOutput(line);
-                if (progress >= 0) {
-                    progressService.updateProgress(downloadId, "downloading", progress, "Downloading video");
+                System.out.println("yt-dlp: " + line);
+                // Parse progress from yt-dlp output
+                DownloadProgress progress = parseProgressLine(line);
+                if (progress != null) {
+                    progressService.updateProgress(
+                            downloadId,
+                            progress.getPercentage(),
+                            progress.getStatus(),
+                            progress.getSpeed(),
+                            progress.getEta()
+                    );
                 }
-                if (line.contains("[Merger]")) {
-                    progressService.updateProgress(downloadId, "converting", 90, "Merging formats");
-                }
+            }
+            int exitCode = process.waitFor();
+            if (exitCode == 0) {
+                progressService.updateProgress(downloadId, 100, "Download completed", "0 KiB/s", "00:00");
+            } else {
+                progressService.updateProgress(downloadId, 0, "Download failed", "0 KiB/s", "Unknown");
             }
             boolean finished = process.waitFor(PROCESS_TIMEOUT, TimeUnit.SECONDS);
             if (!finished) {
@@ -103,11 +161,8 @@ public class YoutubeDownloadService {
                 throw new DownloadException("Download timed out after " + PROCESS_TIMEOUT + " seconds");
             }
             if (process.exitValue() != 0) {
-                progressService.updateProgress(downloadId, "error", 0, "Download failed");
                 throw new DownloadException("Download failed: " + output.toString());
             }
-
-            progressService.updateProgress(downloadId, "completed", 100, "Download completed successfully");
             // Extract downloaded filename from output
             String filename = extractDownloadedFilename(output.toString());
             if (filename != null) {
@@ -127,8 +182,8 @@ public class YoutubeDownloadService {
                 }
             }
         }catch (IOException | InterruptedException e) {
-            progressService.updateProgress(downloadId, "error", 0, "Download error: " + e.getMessage());
             Thread.currentThread().interrupt();
+            progressService.updateProgress(downloadId, 0, "ERROR: " + e.getMessage(), "0 KiB/s", "Unknown");
             throw new DownloadException("Failed to download video", e);
         }
     }
@@ -165,6 +220,7 @@ public class YoutubeDownloadService {
         return null;
     }
     private VideoInfo getVideoInfoWithYtDlp(String videoUrl){
+        Process process = null;
         try {
             ProcessBuilder processBuilder = new ProcessBuilder(
                     YT_DLP_COMMAND,
@@ -172,126 +228,181 @@ public class YoutubeDownloadService {
                     "--no-warnings",
                     videoUrl
             );
-            Process process = processBuilder.start();
+
+            // Redirect error stream so we can see what's wrong
+            processBuilder.redirectErrorStream(true);
+            process = processBuilder.start();
             BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
             StringBuilder jsonOutput = new StringBuilder();
             String line;
-            while ((line = reader.readLine()) != null){
+            while ((line = reader.readLine()) != null) {
                 jsonOutput.append(line);
             }
             boolean finished = process.waitFor(PROCESS_TIMEOUT, TimeUnit.SECONDS);
-            if (!finished){
+            if (!finished) {
                 process.destroy();
-                throw new DownloadException("yt-dlp command timed out");
+                throw new DownloadException("yt-dlp command timed out after " + PROCESS_TIMEOUT + " seconds");
             }
-            if (process.exitValue() != 0){
-                BufferedReader errorReader = new BufferedReader(new InputStreamReader(process.getErrorStream()));
-                StringBuilder errorOutput = new StringBuilder();
-                while ((line = errorReader.readLine()) != null){
-                    errorOutput.append(line).append("\n");
-                }
-                throw new DownloadException("yt-dlp failed: " + errorOutput.toString());
+            int exitCode = process.exitValue();
+            if (exitCode != 0) {
+                throw new DownloadException("yt-dlp failed with exit code: " + exitCode);
             }
-            // Parse the JSON output (simplified parsing - in real implementation use JSON library)
+
+            if (jsonOutput.length() == 0) {
+                throw new DownloadException("yt-dlp returned empty output");
+            }
             return parseYtDlpJsonOutput(jsonOutput.toString());
-        }catch (IOException | InterruptedException e) {
-            throw new DownloadException("Failed to execute yt-dlp command", e);
+
+        } catch (Exception e) {
+            if (process != null) {
+                process.destroyForcibly();
+            }
+            throw new DownloadException("Failed to execute yt-dlp command: " + e.getMessage(), e);
         }
     }
     private VideoInfo parseYtDlpJsonOutput(String jsonOutput){
         try{
-            String id = extractFromJson(jsonOutput, "\"id\":\\s*\"([^\"]+)\"");
-            String title = extractFromJson(jsonOutput, "\"title\":\\s*\"([^\"]+)\"");
-            String description = extractFromJson(jsonOutput, "\"description\":\\s*\"([^\"]+)\"");
-            String thumbnail = extractFromJson(jsonOutput, "\"thumbnail\":\\s*\"([^\"]+)\"");
-            String duration = extractFromJson(jsonOutput, "\"duration\":\\s*([0-9]+)");
-            String viewCount = extractFromJson(jsonOutput, "\"view_count\":\\s*([0-9]+)");
-            String uploadDate = extractFromJson(jsonOutput, "\"upload_date\":\\s*\"([^\"]+)\"");
-            // Parse formats
-            List<VideoFormat> formats = parseFormatsFromJson(jsonOutput);
-            // Format duration
-            String formattedDuration = formatDuration(duration);
-            // Format view count
-            String formattedViews = formatViews(viewCount);
-            // Format upload date
-            String formattedUploadDate = formatUploadDate(uploadDate);
-            return new VideoInfo(id,title,description,thumbnail,formattedDuration,formattedViews,formattedUploadDate,formats);
+//            String id = extractFromJson(jsonOutput, "\"id\":\\s*\"([^\"]+)\"");
+//            String title = extractFromJson(jsonOutput, "\"title\":\\s*\"([^\"]+)\"");
+//            String description = extractFromJson(jsonOutput, "\"description\":\\s*\"([^\"]+)\"");
+//            String thumbnail = extractFromJson(jsonOutput, "\"thumbnail\":\\s*\"([^\"]+)\"");
+//            String duration = extractFromJson(jsonOutput, "\"duration\":\\s*([0-9]+)");
+//            String viewCount = extractFromJson(jsonOutput, "\"view_count\":\\s*([0-9]+)");
+//            String uploadDate = extractFromJson(jsonOutput, "\"upload_date\":\\s*\"([^\"]+)\"");
+//            System.out.println("Id :"+id);
+//            // Parse formats
+//            List<VideoFormat> formats = parseFormatsFromJson(jsonOutput);
+//            // Format duration
+//            String formattedDuration = formatDuration(duration);
+//            // Format view count
+//            String formattedViews = formatViews(viewCount);
+//            // Format upload date
+//            String formattedUploadDate = formatUploadDate(uploadDate);
+//            return new VideoInfo(id,title,description,thumbnail,formattedDuration,formattedViews,formattedUploadDate,formats);
+            ObjectMapper mapper = new ObjectMapper();
+            JsonNode root = mapper.readTree(jsonOutput);
+            String id = root.path("id").asText("Unknown");
+            String title = root.path("title").asText("Unknown");
+            String description = root.path("description").asText("Unknown");
+            String thumbnail = root.path("thumbnail").asText("Unknown");
+            String duration = root.path("duration").asText();
+            String viewCount = root.path("view_count").asText();
+            String uploadDate = root.path("upload_date").asText("Unknown");
+            List<VideoFormat> formats = parseFormatsFromJson(root);
+
+            return new VideoInfo(id, title, description, thumbnail,
+                    formatDuration(duration),
+                    formatViews(viewCount),
+                    formatUploadDate(uploadDate),
+                    formats);
         } catch (Exception e) {
             throw new DownloadException("Failed to parse yt-dlp output", e);
         }
     }
-    private List<VideoFormat> parseFormatsFromJson(String jsonOutput) {
+    private List<VideoFormat> parseFormatsFromJson(JsonNode root) {
+//        List<VideoFormat> formats = new ArrayList<>();
+//
+//        // Extract formats section using regex
+//        Pattern formatPattern = Pattern.compile(
+//                "\"format_id\":\\s*\"([^\"]+)\".*?" +
+//                        "\"ext\":\\s*\"([^\"]+)\".*?" +
+//                        "\"width\":\\s*(\\d+).*?" +
+//                        "\"height\":\\s*(\\d+).*?" +
+//                        "\"fps\":\\s*(\\d+).*?" +
+//                        "\"vcodec\":\\s*\"([^\"]+)\".*?" +
+//                        "\"acodec\":\\s*\"([^\"]+)\".*?" +
+//                        "\"filesize\":\\s*(\\d+)",
+//                Pattern.DOTALL
+//        );
+//
+//        Matcher matcher = formatPattern.matcher(jsonOutput);
+//
+//        while (matcher.find()) {
+//            String formatId = matcher.group(1);
+//            String extension = matcher.group(2);
+//            int width = Integer.parseInt(matcher.group(3));
+//            int height = Integer.parseInt(matcher.group(4));
+//            int fps = Integer.parseInt(matcher.group(5));
+//            String videoCodec = matcher.group(6);
+//            String audioCodec = matcher.group(7);
+//            String fileSize = matcher.group(8);
+//
+//            String quality = height + "p";
+//            String formatType = "Video";
+//            String codec = videoCodec;
+//            String size = formatFileSize(fileSize);
+//
+//            formats.add(new VideoFormat(formatId, quality, formatType, size, fps, codec, audioCodec));
+//        }
+//
+//        // Also extract audio-only formats
+//        Pattern audioPattern = Pattern.compile(
+//                "\"format_id\":\\s*\"([^\"]+)\".*?" +
+//                        "\"ext\":\\s*\"([^\"]+)\".*?" +
+//                        "\"acodec\":\\s*\"([^\"]+)\".*?" +
+//                        "\"asr\":\\s*(\\d+).*?" +
+//                        "\"filesize\":\\s*(\\d+)",
+//                Pattern.DOTALL
+//        );
+//
+//        Matcher audioMatcher = audioPattern.matcher(jsonOutput);
+//
+//        while (audioMatcher.find()) {
+//            String formatId = audioMatcher.group(1);
+//            String extension = audioMatcher.group(2);
+//            String audioCodec = audioMatcher.group(3);
+//            String sampleRate = audioMatcher.group(4);
+//            String fileSize = audioMatcher.group(5);
+//
+//            String quality = "Audio Only";
+//            String formatType = extension.toUpperCase();
+//            String size = formatFileSize(fileSize);
+//            String bitrate = sampleRate != null ? (Integer.parseInt(sampleRate) / 1000) + " kHz" : "Unknown";
+//
+//            formats.add(new VideoFormat(formatId, quality, formatType, size, 0, null, bitrate));
+//        }
+//
+//        return formats;
         List<VideoFormat> formats = new ArrayList<>();
+        JsonNode formatsNode = root.path("formats");
+        if (formatsNode.isArray()) {
+            for (JsonNode format : formatsNode) {
+                try {
+                    String formatId = format.path("format_id").asText();
+                    String extension = format.path("ext").asText();
+                    int width = format.path("width").asInt(0);
+                    int height = format.path("height").asInt(0);
+                    int fps = format.path("fps").asInt(0);
+                    String videoCodec = format.path("vcodec").asText("none");
+                    String audioCodec = format.path("acodec").asText("none");
+                    long fileSize = format.path("filesize").asLong(0);
 
-        // Extract formats section using regex
-        Pattern formatPattern = Pattern.compile(
-                "\"format_id\":\\s*\"([^\"]+)\".*?" +
-                        "\"ext\":\\s*\"([^\"]+)\".*?" +
-                        "\"width\":\\s*(\\d+).*?" +
-                        "\"height\":\\s*(\\d+).*?" +
-                        "\"fps\":\\s*(\\d+).*?" +
-                        "\"vcodec\":\\s*\"([^\"]+)\".*?" +
-                        "\"acodec\":\\s*\"([^\"]+)\".*?" +
-                        "\"filesize\":\\s*(\\d+)",
-                Pattern.DOTALL
-        );
+                    if (!"none".equals(videoCodec)) {
+                        // Video format (with or without audio)
+                        String quality = height > 0 ? height + "p" : "Unknown";
+                        String formatType = "Video";
+                        String size = formatFileSize(String.valueOf(fileSize));
 
-        Matcher matcher = formatPattern.matcher(jsonOutput);
+                        formats.add(new VideoFormat(formatId, quality, formatType,
+                                size, fps, videoCodec, audioCodec));
+                    } else if (!"none".equals(audioCodec)) {
+                        // Audio-only format
+                        String quality = "Audio Only";
+                        String formatType = extension.toUpperCase();
+                        String size = formatFileSize(String.valueOf(fileSize));
+                        int sampleRate = format.path("asr").asInt(0);
+                        String bitrate = sampleRate > 0 ? (sampleRate / 1000) + " kHz" : "Unknown";
 
-        while (matcher.find()) {
-            String formatId = matcher.group(1);
-            String extension = matcher.group(2);
-            int width = Integer.parseInt(matcher.group(3));
-            int height = Integer.parseInt(matcher.group(4));
-            int fps = Integer.parseInt(matcher.group(5));
-            String videoCodec = matcher.group(6);
-            String audioCodec = matcher.group(7);
-            String fileSize = matcher.group(8);
-
-            String quality = height + "p";
-            String formatType = "Video";
-            String codec = videoCodec;
-            String size = formatFileSize(fileSize);
-
-            formats.add(new VideoFormat(formatId, quality, formatType, size, fps, codec, audioCodec));
+                        formats.add(new VideoFormat(formatId, quality, formatType,
+                                size, 0, null, bitrate));
+                    }
+                } catch (Exception e) {
+                    // Log and skip invalid formats
+                    System.err.println("Skipping invalid format: " + e.getMessage());
+                }
+            }
         }
-
-        // Also extract audio-only formats
-        Pattern audioPattern = Pattern.compile(
-                "\"format_id\":\\s*\"([^\"]+)\".*?" +
-                        "\"ext\":\\s*\"([^\"]+)\".*?" +
-                        "\"acodec\":\\s*\"([^\"]+)\".*?" +
-                        "\"asr\":\\s*(\\d+).*?" +
-                        "\"filesize\":\\s*(\\d+)",
-                Pattern.DOTALL
-        );
-
-        Matcher audioMatcher = audioPattern.matcher(jsonOutput);
-
-        while (audioMatcher.find()) {
-            String formatId = audioMatcher.group(1);
-            String extension = audioMatcher.group(2);
-            String audioCodec = audioMatcher.group(3);
-            String sampleRate = audioMatcher.group(4);
-            String fileSize = audioMatcher.group(5);
-
-            String quality = "Audio Only";
-            String formatType = extension.toUpperCase();
-            String size = formatFileSize(fileSize);
-            String bitrate = sampleRate != null ? (Integer.parseInt(sampleRate) / 1000) + " kHz" : "Unknown";
-
-            formats.add(new VideoFormat(formatId, quality, formatType, size, 0, null, bitrate));
-        }
-
         return formats;
-    }
-    private String extractFromJson(String json, String regex) {
-        Pattern pattern = Pattern.compile(regex);
-        Matcher matcher = pattern.matcher(json);
-        if (matcher.find()) {
-            return matcher.group(1);
-        }
-        return "Unknown";
     }
     private String formatFileSize(String bytes){
         if (bytes == null || "Unknown".equals(bytes)) return "Unknown size";
@@ -370,7 +481,6 @@ public class YoutubeDownloadService {
             return false;
         }
     }
-
     private int parseProgressFromOutput(String line) {
         if (line == null || line.trim().isEmpty()) {
             return -1;
@@ -440,7 +550,6 @@ public class YoutubeDownloadService {
 
         return -1;
     }
-
     // Helper method to parse size strings like "10.5MiB", "2.3GB", "512KiB"
     private double parseSize(String value, String unit) {
         try {
@@ -455,5 +564,67 @@ public class YoutubeDownloadService {
         } catch (NumberFormatException e) {
             return 0;
         }
+    }
+    public boolean testYtDlpWithSimpleVideo() {
+        try {
+            // Test with a known working YouTube video
+            String testUrl = "https://youtu.be/1sRaLqtHXQU?si=dONkHZ3gfDhDsFdY"; // First YouTube video
+
+            ProcessBuilder processBuilder = new ProcessBuilder(
+                    YT_DLP_COMMAND,
+                    "--dump-json",
+                    "--no-warnings",
+                    testUrl
+            );
+
+            Process process = processBuilder.start();
+            BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+
+            StringBuilder output = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                output.append(line);
+            }
+
+            boolean finished = process.waitFor(30, TimeUnit.SECONDS);
+            int exitCode = process.exitValue();
+            return finished && exitCode == 0 && output.length() > 0;
+
+        } catch (Exception e) {
+            return false;
+        }
+    }
+    private DownloadProgress parseProgressLine(String line) {
+        try {
+            // Example line: "[download]  25.5% of ~  45.21MiB at  1.34MiB/s ETA 00:45"
+            if (line.contains("[download]") && line.contains("%")) {
+                Pattern pattern = Pattern.compile(
+                        "\\[download\\]\\s+(\\d+\\.?\\d*)%\\s+of\\s+~?\\s*[\\d\\.,]+[KMG]?i?B?\\s+at\\s+([\\d\\.,]+[KMG]?i?B/s)\\s+ETA\\s+([\\d:]+|Unknown)"
+                );
+
+                Matcher matcher = pattern.matcher(line);
+                if (matcher.find()) {
+                    double percentage = Double.parseDouble(matcher.group(1));
+                    String speed = matcher.group(2);
+                    String eta = matcher.group(3);
+
+                    return new DownloadProgress(null, percentage, "Downloading", speed, eta, System.currentTimeMillis());
+                }
+            }
+
+            // Handle different progress formats
+            if (line.contains("[download] Downloading item") || line.contains("[download] Destination:")) {
+                return new DownloadProgress(null, 0, "Starting download...", "0 KiB/s", "Unknown", System.currentTimeMillis());
+            }
+
+            if (line.contains("[download] 100%")) {
+                return new DownloadProgress(null, 100, "Download completed", "0 KiB/s", "00:00", System.currentTimeMillis());
+            }
+
+        } catch (Exception e) {
+            System.err.println("Error parsing progress line: " + line);
+        }
+
+        return null;
     }
 }

@@ -4,6 +4,7 @@ import jakarta.inject.Inject;
 import jakarta.ws.rs.*;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
+import org.virtual.society.model.DownloadProgress;
 import org.virtual.society.model.DownloadRequest;
 import org.virtual.society.model.DownloadStatus;
 import org.virtual.society.model.VideoInfo;
@@ -42,6 +43,13 @@ public class DownloadController {
     @Path("/info")
     public Response getVideoInfo(@QueryParam("url") String url) {
         try {
+            boolean ytDlpWorking = downloadService.testYtDlpWithSimpleVideo();
+            if (!ytDlpWorking) {
+                return Response.status(Response.Status.INTERNAL_SERVER_ERROR)
+                        .entity("{\"error\": \"yt-dlp is not working properly\"}")
+                        .build();
+            }
+
             VideoInfo videoInfo = downloadService.getVideoInfo(url);
             return Response.ok(videoInfo).build();
         } catch (Exception e) {
@@ -71,7 +79,8 @@ public class DownloadController {
             Map<String, String> response = new HashMap<>();
             response.put("downloadId", downloadId);
             response.put("status", "started");
-            return Response.ok() .entity("{\"message\": \"Download completed\", \"filename\": \"" + response + "\"}").build();
+            System.out.println(response );
+            return Response.ok() .entity(response).build();
         } catch (Exception e) {
             return Response.status(Response.Status.INTERNAL_SERVER_ERROR)
                     .entity("{\"error\": \"" + e.getMessage() + "\"}")
@@ -82,7 +91,24 @@ public class DownloadController {
     @GET
     @Path("/progress/{downloadId}")
     public Response getProgress(@PathParam("downloadId") String  downloadId){
-        DownloadStatus status = progressService.getProgress(downloadId);
-        return Response.ok(status).build();
+      try {
+          DownloadProgress progress = progressService.getProgress(downloadId);
+          if (progress == null) {
+              return Response.status(Response.Status.NOT_FOUND)
+                      .entity("{\"error\": \"Download not found\"}")
+                      .build();
+          }
+          // Clean up completed downloads after some time
+          if (progress.getPercentage() >= 100 &&
+                  System.currentTimeMillis() - progress.getLastUpdate() > 30000) { // 30 seconds
+              progressService.removeProgress(downloadId);
+          }
+
+          return Response.ok(progress).build();
+      }catch (Exception e){
+          return Response.status(Response.Status.INTERNAL_SERVER_ERROR)
+                  .entity("{\"error\": \"" + e.getMessage() + "\"}")
+                  .build();
+      }
     }
 }
