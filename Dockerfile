@@ -3,17 +3,19 @@ FROM eclipse-temurin:21-jdk AS build
 
 WORKDIR /workspace
 
-# Copy Maven wrapper and pom.xml
-COPY .mvn/ .mvn
-COPY mvnw mvnw.cmd pom.xml ./
+# Copy Maven files first
+COPY pom.xml .
+COPY mvnw .
+COPY mvnw.cmd .
+COPY .mvn .mvn
 
-# Pre-fetch dependencies (improves build speed)
-RUN ./mvnw dependency:go-offline
+# Pre-fetch dependencies
+RUN ./mvnw dependency:go-offline -B
 
-# Copy source code
+# Copy source code AFTER dependencies are downloaded
 COPY src src
 
-# Build the app (skip tests to avoid failures)
+# Build app (skip tests)
 RUN ./mvnw -DskipTests -Dquarkus.package.jar.type=uber-jar package
 
 
@@ -21,12 +23,9 @@ RUN ./mvnw -DskipTests -Dquarkus.package.jar.type=uber-jar package
 FROM eclipse-temurin:21-jdk
 
 WORKDIR /app
+COPY --from=build /workspace/target/*-runner.jar app.jar
 
-# Copy compiled jar from the build stage
-COPY --from=build /workspace/target/*-runner.jar /app/app.jar
-
-# Railway/Docker dynamic port support
-EXPOSE 8080
 ENV PORT=8080
+EXPOSE 8080
 
-CMD ["java", "-jar", "/app/app.jar"]
+CMD ["java", "-jar", "app.jar"]
