@@ -10,10 +10,13 @@ import org.virtual.society.model.DownloadStatus;
 import org.virtual.society.model.VideoInfo;
 import org.virtual.society.service.DownloadProgressService;
 import org.virtual.society.service.YoutubeDownloadService;
+
+import java.io.File;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 
 @Path("/api/download")
 @Produces(MediaType.APPLICATION_JSON)
@@ -25,6 +28,10 @@ public class DownloadController {
 
     @Inject
     DownloadProgressService progressService;
+
+    // Store active downloads
+    private final ConcurrentHashMap<String, CompletableFuture<File>> activeDownloads = new ConcurrentHashMap<>();
+
 
     @GET
     @Path("/health")
@@ -72,10 +79,21 @@ public class DownloadController {
     public Response downloadVideo(DownloadRequest request){
         try {
             String downloadId = UUID.randomUUID().toString();
-            CompletableFuture.runAsync(()->{
-                downloadService.downloadVideo(request.getUrl(),request.getFormatId(),downloadId);
+            // Start download asynchronously
+            CompletableFuture<File> downloadFuture = downloadService.downloadVideo(
+                    request.getUrl(),
+                    request.getFormatId(),
+                    downloadId
+            );
+            // Store the future for potential cancellation
+            activeDownloads.put(downloadId, downloadFuture);
+            // Clean up when completed
+            downloadFuture.whenComplete((result, throwable) -> {
+                activeDownloads.remove(downloadId);
+                if (throwable != null) {
+                    System.err.println("Download failed for " + downloadId + ": " + throwable.getMessage());
+                }
             });
-//            File videoFile = downloadService.downloadVideo(request.getUrl(), request.getFormatId());
             Map<String, String> response = new HashMap<>();
             response.put("downloadId", downloadId);
             response.put("status", "started");
@@ -83,7 +101,7 @@ public class DownloadController {
             return Response.ok() .entity(response).build();
         } catch (Exception e) {
             return Response.status(Response.Status.INTERNAL_SERVER_ERROR)
-                    .entity("{\"error\": \"" + e.getMessage() + "\"}")
+                    .entity(Map.of("error", e.getMessage()))
                     .build();
         }
     }

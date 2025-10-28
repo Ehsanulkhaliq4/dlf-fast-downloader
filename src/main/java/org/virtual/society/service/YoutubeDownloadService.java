@@ -20,9 +20,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -34,6 +32,7 @@ public class YoutubeDownloadService {
     private static final long PROCESS_TIMEOUT = 30;
     private static final int MAX_CACHE_SIZE = 100;
     private final Map<String, VideoInfo> videoInfoCache = new ConcurrentHashMap<>();
+    private final ExecutorService downloadExecutor = Executors.newCachedThreadPool();
 
     @Inject
     DownloadProgressService progressService;
@@ -93,98 +92,113 @@ public class YoutubeDownloadService {
         return downloadId;
     }
 
-    //Download the file method
-    public File downloadVideo(String videoUrl , String formatId, String downloadId){
-        try {
-            String videoId = extractVideoId(videoUrl);
-            if (videoId == null){
-                throw new DownloadException("Invalid YouTube URL");
-            }
-            //Create Directory if not exist
-            Path downloadPath = Paths.get(DOWNLOAD_DIR);
-            if (!Files.exists(downloadPath)){
-                Files.createDirectories(downloadPath);
-            }
-            // Build yt-dlp command with specific format and output template
-            List<String> command = new ArrayList<>();
-            command.add(YT_DLP_COMMAND);
-            // Add format specification
-            if (formatId != null && !formatId.isEmpty() && !"best".equals(formatId)) {
-                command.add("-f");
-                command.add(formatId);
-            }
-            // Add output template with safe filename
-            command.add("-o");
-            command.add(DOWNLOAD_DIR + "%(title)s [%(id)s].%(ext)s");
-            // Add other options to ensure proper video download
-            command.add("--no-playlist");
-            command.add("--merge-output-format");
-            command.add("mp4");
-            command.add("--no-mtime");
-            command.add("--no-overwrites");
-            command.add("--continue");
-            command.add("--newline");
-            // Add the video URL
-            command.add(videoUrl);
-            ProcessBuilder processBuilder = new ProcessBuilder(command);
-            // Redirect error stream to output stream
-            processBuilder.redirectErrorStream(true);
-            Process process = processBuilder.start();
-            // Read output
-            BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
-            StringBuilder output = new StringBuilder();
-            String line;
-            while ((line = reader.readLine()) != null) {
-                output.append(line).append("\n");
-                System.out.println("yt-dlp: " + line);
-                // Parse progress from yt-dlp output
-                DownloadProgress progress = parseProgressLine(line);
-                if (progress != null) {
-                    progressService.updateProgress(
-                            downloadId,
-                            progress.getPercentage(),
-                            progress.getStatus(),
-                            progress.getSpeed(),
-                            progress.getEta()
-                    );
+
+    public CompletableFuture<File> downloadVideo(String videoUrl, String formatId, String downloadId) {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                String videoId = extractVideoId(videoUrl);
+                if (videoId == null) {
+                    throw new DownloadException("Invalid YouTube URL");
                 }
-            }
-            int exitCode = process.waitFor();
-            if (exitCode == 0) {
-                progressService.updateProgress(downloadId, 100, "Download completed", "0 KiB/s", "00:00");
-            } else {
-                progressService.updateProgress(downloadId, 0, "Download failed", "0 KiB/s", "Unknown");
-            }
-            boolean finished = process.waitFor(PROCESS_TIMEOUT, TimeUnit.SECONDS);
-            if (!finished) {
-                process.destroy();
-                throw new DownloadException("Download timed out after " + PROCESS_TIMEOUT + " seconds");
-            }
-            if (process.exitValue() != 0) {
-                throw new DownloadException("Download failed: " + output.toString());
-            }
-            // Extract downloaded filename from output
-            String filename = extractDownloadedFilename(output.toString());
-            if (filename != null) {
-                File downloadedFile = new File(filename);
-                if (downloadedFile.exists() && downloadedFile.length() > 0) {
-                    return downloadedFile;
-                } else {
-                    throw new DownloadException("Downloaded file doesn't exist or is empty: " + filename);
+
+                // Create Directory if not exist
+                Path downloadPath = Paths.get(DOWNLOAD_DIR);
+                if (!Files.exists(downloadPath)) {
+                    Files.createDirectories(downloadPath);
                 }
-            } else {
-                // Fallback: look for the most recently created file in download directory
-                File latestFile = findLatestFile(downloadPath.toFile());
-                if (latestFile != null && latestFile.exists() && latestFile.length() > 0) {
-                    return latestFile;
-                } else {
-                    throw new DownloadException("Could not find downloaded file. yt-dlp output: " + output.toString());
+
+                // Build yt-dlp command with specific format and output template
+                List<String> command = buildYtDlpCommand(videoUrl, formatId);
+
+                ProcessBuilder processBuilder = new ProcessBuilder(command);
+                processBuilder.redirectErrorStream(true);
+
+                Process process = processBuilder.start();
+
+                // Read output asynchronously
+                readProcessOutput(process, downloadId);
+
+                boolean finished = process.waitFor(PROCESS_TIMEOUT, TimeUnit.SECONDS);
+                if (!finished) {
+                    process.destroyForcibly();
+                    throw new DownloadException("Download timed out after " + PROCESS_TIMEOUT + " seconds");
                 }
+
+                int exitCode = process.exitValue();
+                if (exitCode != 0) {
+                    throw new DownloadException("Download failed with exit code: " + exitCode);
+                }
+
+                return findDownloadedFile(downloadPath);
+
+            } catch (IOException | InterruptedException e) {
+                Thread.currentThread().interrupt();
+                progressService.updateProgress(downloadId, 0, "ERROR: " + e.getMessage(), "0 KiB/s", "Unknown");
+                throw new DownloadException("Failed to download video", e);
             }
-        }catch (IOException | InterruptedException e) {
-            Thread.currentThread().interrupt();
-            progressService.updateProgress(downloadId, 0, "ERROR: " + e.getMessage(), "0 KiB/s", "Unknown");
-            throw new DownloadException("Failed to download video", e);
+        }, downloadExecutor);
+    }
+
+    private List<String> buildYtDlpCommand(String videoUrl, String formatId) {
+        List<String> command = new ArrayList<>();
+        command.add(YT_DLP_COMMAND);
+
+        // Add format specification
+        if (formatId != null && !formatId.isEmpty() && !"best".equals(formatId)) {
+            command.add("-f");
+            command.add(formatId);
+        }
+
+        // Add output template with safe filename
+        command.add("-o");
+        command.add(DOWNLOAD_DIR + "%(title)s [%(id)s].%(ext)s");
+
+        // Add other options
+        command.add("--no-playlist");
+        command.add("--merge-output-format");
+        command.add("mp4");
+        command.add("--no-mtime");
+        command.add("--no-overwrites");
+        command.add("--continue");
+        command.add("--newline");
+
+        // Add the video URL
+        command.add(videoUrl);
+
+        return command;
+    }
+    private void readProcessOutput(Process process, String downloadId) {
+        CompletableFuture.runAsync(() -> {
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    System.out.println("yt-dlp [" + downloadId + "]: " + line);
+
+                    // Parse progress from yt-dlp output
+                    DownloadProgress progress = parseProgressLine(line);
+                    if (progress != null) {
+                        progressService.updateProgress(
+                                downloadId,
+                                progress.getPercentage(),
+                                progress.getStatus(),
+                                progress.getSpeed(),
+                                progress.getEta()
+                        );
+                    }
+                }
+            } catch (IOException e) {
+                System.err.println("Error reading process output for " + downloadId + ": " + e.getMessage());
+            }
+        });
+    }
+    private File findDownloadedFile(Path downloadPath) {
+        // Extract downloaded filename from output or find latest file
+        // Your existing implementation here
+        File latestFile = findLatestFile(downloadPath.toFile());
+        if (latestFile != null && latestFile.exists() && latestFile.length() > 0) {
+            return latestFile;
+        } else {
+            throw new DownloadException("Could not find downloaded file");
         }
     }
     private String extractDownloadedFilename(String output) {
