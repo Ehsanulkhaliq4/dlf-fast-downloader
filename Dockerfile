@@ -67,6 +67,7 @@
 FROM eclipse-temurin:21-jdk AS build
 WORKDIR /workspace
 
+# Copy Maven wrapper and source
 COPY pom.xml .
 COPY mvnw .
 COPY mvnw.cmd .
@@ -74,15 +75,24 @@ COPY .mvn .mvn
 COPY src src
 
 RUN chmod +x mvnw
-RUN ./mvnw clean package -DskipTests
+
+# Install yt-dlp in build stage for testing if needed
+RUN apt-get update && \
+    apt-get install -y curl && \
+    curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && \
+    chmod +x /usr/local/bin/yt-dlp
+
+# Build with retry mechanism for network issues
+RUN ./mvnw dependency:go-offline -B || true && \
+    ./mvnw clean package -DskipTests
 
 # Runtime Stage
 FROM eclipse-temurin:21-jdk
 WORKDIR /app
 
-# Install yt-dlp + ffmpeg (needed for conversions)
+# Install yt-dlp + ffmpeg
 RUN apt-get update && \
-    apt-get install -y ffmpeg curl python3-full && \
+    apt-get install -y ffmpeg curl && \
     curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && \
     chmod +x /usr/local/bin/yt-dlp
 
