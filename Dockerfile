@@ -52,3 +52,12 @@ COPY --from=build /workspace/target/quarkus-app/ ./
 EXPOSE 8080
 
 CMD ["java", "-jar", "quarkus-run.jar"]
+
+# Install python3 and pip
+RUN apt-get update && \
+    apt-get install -y python3 python3-pip && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install yt-dlp
+RUN pip3 install yt-dlp
+
