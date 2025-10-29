@@ -580,6 +580,7 @@ public class YoutubeDownloadService {
         }
     }
     public boolean testYtDlpWithSimpleVideo() {
+        Process process = null;
         try {
             // Test with a known working YouTube video
             String testUrl = "https://youtu.be/1sRaLqtHXQU?si=dONkHZ3gfDhDsFdY"; // First YouTube video
@@ -591,7 +592,7 @@ public class YoutubeDownloadService {
                     testUrl
             );
 
-            Process process = processBuilder.start();
+            process = processBuilder.start();
             BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
 
             StringBuilder output = new StringBuilder();
@@ -602,10 +603,25 @@ public class YoutubeDownloadService {
 
             boolean finished = process.waitFor(30, TimeUnit.SECONDS);
             int exitCode = process.exitValue();
-            return finished && exitCode == 0 && output.length() > 0;
+            boolean success = finished && exitCode == 0 && output.length() > 0;
 
-        } catch (Exception e) {
+            if (!success) {
+                System.err.println("yt-dlp test failed:");
+                System.err.println("Exit code: " + exitCode);
+            }
+
+            return success;
+
+        } catch (IOException e) {
+            System.err.println("IOException - yt-dlp likely not installed: " + e.getMessage());
             return false;
+        } catch (Exception e) {
+            System.err.println("Unexpected error: " + e.getMessage());
+            return false;
+        } finally {
+            if (process != null) {
+                process.destroy();
+            }
         }
     }
     private DownloadProgress parseProgressLine(String line) {
