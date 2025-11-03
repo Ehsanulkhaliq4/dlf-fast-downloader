@@ -2,9 +2,6 @@ package org.virtual.society.service;
 
 import jakarta.enterprise.context.ApplicationScoped;
 import org.virtual.society.model.DownloadProgress;
-import org.virtual.society.model.DownloadStatus;
-
-import java.util.Date;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 

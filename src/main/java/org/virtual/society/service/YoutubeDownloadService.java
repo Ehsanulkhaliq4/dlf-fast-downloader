@@ -76,22 +76,6 @@ public class YoutubeDownloadService {
         }
         return url.matches("^(https?://)?(www\\.)?(youtube\\.com|youtu\\.?be)/.+$");
     }
-    //Start Download Method for progress tracking
-    public String startDownload(String videoUrl, String formatId) {
-        String downloadId = UUID.randomUUID().toString();
-
-        // Start download in background thread
-        CompletableFuture.runAsync(() -> {
-            try {
-                downloadVideo(videoUrl, formatId, downloadId);
-            } catch (Exception e) {
-                progressService.updateProgress(downloadId, 0, "ERROR: " + e.getMessage(), "0 KiB/s", "Unknown");
-            }
-        });
-
-        return downloadId;
-    }
-
 
     public CompletableFuture<File> downloadVideo(String videoUrl, String formatId, String downloadId) {
         return CompletableFuture.supplyAsync(() -> {
@@ -119,11 +103,6 @@ public class YoutubeDownloadService {
                 readProcessOutput(process, downloadId);
 
                 boolean finished = process.waitFor(PROCESS_TIMEOUT, TimeUnit.SECONDS);
-                if (!finished) {
-                    process.destroyForcibly();
-                    throw new DownloadException("Download timed out after " + PROCESS_TIMEOUT + " seconds");
-                }
-
                 int exitCode = process.exitValue();
                 if (exitCode != 0) {
                     throw new DownloadException("Download failed with exit code: " + exitCode);
@@ -172,8 +151,6 @@ public class YoutubeDownloadService {
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
                 String line;
                 while ((line = reader.readLine()) != null) {
-                    System.out.println("yt-dlp [" + downloadId + "]: " + line);
-
                     // Parse progress from yt-dlp output
                     DownloadProgress progress = parseProgressLine(line);
                     if (progress != null) {
@@ -200,15 +177,6 @@ public class YoutubeDownloadService {
         } else {
             throw new DownloadException("Could not find downloaded file");
         }
-    }
-    private String extractDownloadedFilename(String output) {
-        // yt-dlp output usually contains the destination filename
-        Pattern pattern = Pattern.compile("\\[download\\] Destination:\\s*(.+)");
-        Matcher matcher = pattern.matcher(output);
-        if (matcher.find()) {
-            return matcher.group(1).trim();
-        }
-        return null;
     }
     private File findLatestFile(File directory) {
         File[] files = directory.listFiles();
@@ -276,23 +244,6 @@ public class YoutubeDownloadService {
     }
     private VideoInfo parseYtDlpJsonOutput(String jsonOutput){
         try{
-//            String id = extractFromJson(jsonOutput, "\"id\":\\s*\"([^\"]+)\"");
-//            String title = extractFromJson(jsonOutput, "\"title\":\\s*\"([^\"]+)\"");
-//            String description = extractFromJson(jsonOutput, "\"description\":\\s*\"([^\"]+)\"");
-//            String thumbnail = extractFromJson(jsonOutput, "\"thumbnail\":\\s*\"([^\"]+)\"");
-//            String duration = extractFromJson(jsonOutput, "\"duration\":\\s*([0-9]+)");
-//            String viewCount = extractFromJson(jsonOutput, "\"view_count\":\\s*([0-9]+)");
-//            String uploadDate = extractFromJson(jsonOutput, "\"upload_date\":\\s*\"([^\"]+)\"");
-//            System.out.println("Id :"+id);
-//            // Parse formats
-//            List<VideoFormat> formats = parseFormatsFromJson(jsonOutput);
-//            // Format duration
-//            String formattedDuration = formatDuration(duration);
-//            // Format view count
-//            String formattedViews = formatViews(viewCount);
-//            // Format upload date
-//            String formattedUploadDate = formatUploadDate(uploadDate);
-//            return new VideoInfo(id,title,description,thumbnail,formattedDuration,formattedViews,formattedUploadDate,formats);
             ObjectMapper mapper = new ObjectMapper();
             JsonNode root = mapper.readTree(jsonOutput);
             String id = root.path("id").asText("Unknown");
@@ -314,69 +265,6 @@ public class YoutubeDownloadService {
         }
     }
     private List<VideoFormat> parseFormatsFromJson(JsonNode root) {
-//        List<VideoFormat> formats = new ArrayList<>();
-//
-//        // Extract formats section using regex
-//        Pattern formatPattern = Pattern.compile(
-//                "\"format_id\":\\s*\"([^\"]+)\".*?" +
-//                        "\"ext\":\\s*\"([^\"]+)\".*?" +
-//                        "\"width\":\\s*(\\d+).*?" +
-//                        "\"height\":\\s*(\\d+).*?" +
-//                        "\"fps\":\\s*(\\d+).*?" +
-//                        "\"vcodec\":\\s*\"([^\"]+)\".*?" +
-//                        "\"acodec\":\\s*\"([^\"]+)\".*?" +
-//                        "\"filesize\":\\s*(\\d+)",
-//                Pattern.DOTALL
-//        );
-//
-//        Matcher matcher = formatPattern.matcher(jsonOutput);
-//
-//        while (matcher.find()) {
-//            String formatId = matcher.group(1);
-//            String extension = matcher.group(2);
-//            int width = Integer.parseInt(matcher.group(3));
-//            int height = Integer.parseInt(matcher.group(4));
-//            int fps = Integer.parseInt(matcher.group(5));
-//            String videoCodec = matcher.group(6);
-//            String audioCodec = matcher.group(7);
-//            String fileSize = matcher.group(8);
-//
-//            String quality = height + "p";
-//            String formatType = "Video";
-//            String codec = videoCodec;
-//            String size = formatFileSize(fileSize);
-//
-//            formats.add(new VideoFormat(formatId, quality, formatType, size, fps, codec, audioCodec));
-//        }
-//
-//        // Also extract audio-only formats
-//        Pattern audioPattern = Pattern.compile(
-//                "\"format_id\":\\s*\"([^\"]+)\".*?" +
-//                        "\"ext\":\\s*\"([^\"]+)\".*?" +
-//                        "\"acodec\":\\s*\"([^\"]+)\".*?" +
-//                        "\"asr\":\\s*(\\d+).*?" +
-//                        "\"filesize\":\\s*(\\d+)",
-//                Pattern.DOTALL
-//        );
-//
-//        Matcher audioMatcher = audioPattern.matcher(jsonOutput);
-//
-//        while (audioMatcher.find()) {
-//            String formatId = audioMatcher.group(1);
-//            String extension = audioMatcher.group(2);
-//            String audioCodec = audioMatcher.group(3);
-//            String sampleRate = audioMatcher.group(4);
-//            String fileSize = audioMatcher.group(5);
-//
-//            String quality = "Audio Only";
-//            String formatType = extension.toUpperCase();
-//            String size = formatFileSize(fileSize);
-//            String bitrate = sampleRate != null ? (Integer.parseInt(sampleRate) / 1000) + " kHz" : "Unknown";
-//
-//            formats.add(new VideoFormat(formatId, quality, formatType, size, 0, null, bitrate));
-//        }
-//
-//        return formats;
         List<VideoFormat> formats = new ArrayList<>();
         JsonNode formatsNode = root.path("formats");
         if (formatsNode.isArray()) {
@@ -384,7 +272,6 @@ public class YoutubeDownloadService {
                 try {
                     String formatId = format.path("format_id").asText();
                     String extension = format.path("ext").asText();
-                    int width = format.path("width").asInt(0);
                     int height = format.path("height").asInt(0);
                     int fps = format.path("fps").asInt(0);
                     String videoCodec = format.path("vcodec").asText("none");
@@ -494,75 +381,6 @@ public class YoutubeDownloadService {
         }catch (IOException | InterruptedException e) {
             return false;
         }
-    }
-    private int parseProgressFromOutput(String line) {
-        if (line == null || line.trim().isEmpty()) {
-            return -1;
-        }
-
-        try {
-            // Check for common completion indicators first
-            if (line.contains("100%") ||
-                    line.contains("Download completed") ||
-                    line.contains("already been downloaded")) {
-                return 100;
-            }
-
-            // Pattern 1: Standard progress percentage [download]  12.5% of 10.01MiB
-            Pattern percentagePattern = Pattern.compile("\\[download\\].*?(\\d+\\.?\\d*)%");
-            Matcher percentageMatcher = percentagePattern.matcher(line);
-            if (percentageMatcher.find()) {
-                float progress = Float.parseFloat(percentageMatcher.group(1));
-                return Math.min(100, Math.max(0, (int) progress));
-            }
-
-            // Pattern 2: Fractional progress [download] Downloading item 3 of 5
-            Pattern fractionPattern = Pattern.compile("\\[download\\].*?(\\d+)\\s+of\\s+(\\d+)");
-            Matcher fractionMatcher = fractionPattern.matcher(line);
-            if (fractionMatcher.find()) {
-                int current = Integer.parseInt(fractionMatcher.group(1));
-                int total = Integer.parseInt(fractionMatcher.group(2));
-                if (total > 0 && current <= total) {
-                    return (int) ((current * 100.0) / total);
-                }
-            }
-
-            // Pattern 3: File size progress [download]  5.2MiB of 10.1MiB
-            Pattern sizePattern = Pattern.compile("\\[download\\].*?(\\d+\\.?\\d*)([KMG]?i?B)\\s+of\\s+(\\d+\\.?\\d*)([KMG]?i?B)");
-            Matcher sizeMatcher = sizePattern.matcher(line);
-            if (sizeMatcher.find()) {
-                double currentSize = parseSize(sizeMatcher.group(1), sizeMatcher.group(2));
-                double totalSize = parseSize(sizeMatcher.group(3), sizeMatcher.group(4));
-                if (totalSize > 0) {
-                    int progress = (int) ((currentSize * 100.0) / totalSize);
-                    return Math.min(100, progress);
-                }
-            }
-
-            // Pattern 4: Processing stages
-            if (line.contains("[Merger]")) {
-                return 90; // Merging formats
-            }
-            if (line.contains("[ExtractAudio]")) {
-                return 95; // Extracting audio
-            }
-            if (line.contains("[Metadata]")) {
-                return 97; // Adding metadata
-            }
-            if (line.contains("[info]")) {
-                return 99; // Final info messages
-            }
-
-            // Pattern 5: Error messages
-            if (line.contains("ERROR") || line.contains("error") || line.contains("failed")) {
-                return -2; // Special value to indicate error
-            }
-
-        } catch (Exception e) {
-            System.err.println("Error parsing progress from line: " + line + " - " + e.getMessage());
-        }
-
-        return -1;
     }
     // Helper method to parse size strings like "10.5MiB", "2.3GB", "512KiB"
     private double parseSize(String value, String unit) {

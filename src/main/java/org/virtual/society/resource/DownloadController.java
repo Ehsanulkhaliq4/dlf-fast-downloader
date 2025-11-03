@@ -2,11 +2,12 @@ package org.virtual.society.resource;
 
 import jakarta.inject.Inject;
 import jakarta.ws.rs.*;
+import jakarta.ws.rs.container.AsyncResponse;
+import jakarta.ws.rs.container.Suspended;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import org.virtual.society.model.DownloadProgress;
 import org.virtual.society.model.DownloadRequest;
-import org.virtual.society.model.DownloadStatus;
 import org.virtual.society.model.VideoInfo;
 import org.virtual.society.service.DownloadProgressService;
 import org.virtual.society.service.YoutubeDownloadService;
@@ -48,22 +49,27 @@ public class DownloadController {
 
     @GET
     @Path("/info")
-    public Response getVideoInfo(@QueryParam("url") String url) {
-        try {
-            boolean ytDlpWorking = downloadService.testYtDlpWithSimpleVideo();
-            if (!ytDlpWorking) {
-                return Response.status(Response.Status.INTERNAL_SERVER_ERROR)
-                        .entity("{\"error\": \"yt-dlp is not working properly\"}")
-                        .build();
-            }
+    public void getVideoInfo(@QueryParam("url") String url , @Suspended final AsyncResponse asyncResponse) {
+        // Reuse your existing logic in a thread
+        new Thread(() -> {
+            try {
+                // Your original code here
+                boolean ytDlpWorking = downloadService.testYtDlpWithSimpleVideo();
+                if (!ytDlpWorking) {
+                    asyncResponse.resume(Response.status(Response.Status.INTERNAL_SERVER_ERROR)
+                            .entity("{\"error\": \"yt-dlp is not working properly\"}")
+                            .build());
+                    return;
+                }
 
-            VideoInfo videoInfo = downloadService.getVideoInfo(url);
-            return Response.ok(videoInfo).build();
-        } catch (Exception e) {
-            return Response.status(Response.Status.INTERNAL_SERVER_ERROR)
-                    .entity("{\"error\": \"" + e.getMessage() + "\"}")
-                    .build();
-        }
+                VideoInfo videoInfo = downloadService.getVideoInfo(url);
+                asyncResponse.resume(Response.ok(videoInfo).build());
+            } catch (Exception e) {
+                asyncResponse.resume(Response.status(Response.Status.INTERNAL_SERVER_ERROR)
+                        .entity("{\"error\": \"" + e.getMessage() + "\"}")
+                        .build());
+            }
+        }).start();
     }
     @GET
     @Path("/status/{jobId}")
