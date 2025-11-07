@@ -27,7 +27,13 @@ import java.util.regex.Pattern;
 @ApplicationScoped
 public class YoutubeDownloadService {
 
-    private static final String DOWNLOAD_DIR = System.getProperty("user.dir") + "/downloads/";
+//    private static final String DOWNLOAD_DIR = System.getProperty("user.dir") + "/downloads/";
+// Better approach
+private static final String DOWNLOAD_DIR =
+        Paths.get(System.getProperty("user.dir"), "downloads").toString() + File.separator;
+    // Even better - use Paths consistently
+    private static final Path DOWNLOAD_PATH =
+            Paths.get(System.getProperty("user.dir"), "downloads");
     private static final String YT_DLP_COMMAND = "yt-dlp";
     private static final long PROCESS_TIMEOUT = 30;
     private static final int MAX_CACHE_SIZE = 100;
@@ -95,6 +101,7 @@ public class YoutubeDownloadService {
                 List<String> command = buildYtDlpCommand(videoUrl, formatId);
 
                 ProcessBuilder processBuilder = new ProcessBuilder(command);
+                processBuilder.directory(DOWNLOAD_PATH.toFile());
                 processBuilder.redirectErrorStream(true);
 
                 Process process = processBuilder.start();
