@@ -19,7 +19,6 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 import java.util.concurrent.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -27,22 +26,19 @@ import java.util.regex.Pattern;
 @ApplicationScoped
 public class YoutubeDownloadService {
 
-//    private static final String DOWNLOAD_DIR = System.getProperty("user.dir") + "/downloads/";
-// Better approach
 private static final String DOWNLOAD_DIR =
         Paths.get(System.getProperty("user.dir"), "downloads").toString() + File.separator;
-    // Even better - use Paths consistently
     private static final Path DOWNLOAD_PATH =
             Paths.get(System.getProperty("user.dir"), "downloads");
     private static final String YT_DLP_COMMAND = "yt-dlp";
-    private static final long PROCESS_TIMEOUT = 30;
+    private static final long PROCESS_TIMEOUT = 300;
     private static final int MAX_CACHE_SIZE = 100;
     private final Map<String, VideoInfo> videoInfoCache = new ConcurrentHashMap<>();
     private final ExecutorService downloadExecutor = Executors.newCachedThreadPool();
 
     @Inject
     DownloadProgressService progressService;
-    // Main Download Method Get Details and every thing
+
     public VideoInfo getVideoInfo(String videoUrl){
         if (!isValidYouTubeUrl(videoUrl)) {
             throw new DownloadException("Invalid YouTube URL: " + videoUrl);
@@ -62,7 +58,7 @@ private static final String DOWNLOAD_DIR =
         videoInfoCache.put(videoUrl, freshInfo);
         return freshInfo;
     }
-    // This is your original method renamed
+
     private VideoInfo getVideoInfoDirect(String videoUrl) {
         try {
             String videoId = extractVideoId(videoUrl);
@@ -75,7 +71,7 @@ private static final String DOWNLOAD_DIR =
             throw new DownloadException("Failed to fetch video information: " + e.getMessage(), e);
         }
     }
-    // Validate YouTube URL format
+
     private boolean isValidYouTubeUrl(String url) {
         if (url == null || url.trim().isEmpty()) {
             return false;
@@ -90,31 +86,26 @@ private static final String DOWNLOAD_DIR =
                 if (videoId == null) {
                     throw new DownloadException("Invalid YouTube URL");
                 }
-
-                // Create Directory if not exist
                 Path downloadPath = Paths.get(DOWNLOAD_DIR);
                 if (!Files.exists(downloadPath)) {
                     Files.createDirectories(downloadPath);
                 }
-
-                // Build yt-dlp command with specific format and output template
                 List<String> command = buildYtDlpCommand(videoUrl, formatId);
 
                 ProcessBuilder processBuilder = new ProcessBuilder(command);
                 processBuilder.directory(DOWNLOAD_PATH.toFile());
                 processBuilder.redirectErrorStream(true);
-
                 Process process = processBuilder.start();
-
-                // Read output asynchronously
                 readProcessOutput(process, downloadId);
-
                 boolean finished = process.waitFor(PROCESS_TIMEOUT, TimeUnit.SECONDS);
+                if (!finished) {
+                    process.destroyForcibly();
+                    throw new DownloadException("Download timed out after " + PROCESS_TIMEOUT + " seconds");
+                }
                 int exitCode = process.exitValue();
                 if (exitCode != 0) {
                     throw new DownloadException("Download failed with exit code: " + exitCode);
                 }
-
                 return findDownloadedFile(downloadPath);
 
             } catch (IOException | InterruptedException e) {
@@ -128,11 +119,14 @@ private static final String DOWNLOAD_DIR =
     private List<String> buildYtDlpCommand(String videoUrl, String formatId) {
         List<String> command = new ArrayList<>();
         command.add(YT_DLP_COMMAND);
-
+        command.add("-v");
         // Add format specification
         if (formatId != null && !formatId.isEmpty() && !"best".equals(formatId)) {
             command.add("-f");
             command.add(formatId);
+        } else {
+            command.add("-f");
+            command.add("bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best");
         }
 
         // Add output template with safe filename
@@ -176,8 +170,6 @@ private static final String DOWNLOAD_DIR =
         });
     }
     private File findDownloadedFile(Path downloadPath) {
-        // Extract downloaded filename from output or find latest file
-        // Your existing implementation here
         File latestFile = findLatestFile(downloadPath.toFile());
         if (latestFile != null && latestFile.exists() && latestFile.length() > 0) {
             return latestFile;
@@ -218,7 +210,6 @@ private static final String DOWNLOAD_DIR =
                     videoUrl
             );
 
-            // Redirect error stream so we can see what's wrong
             processBuilder.redirectErrorStream(true);
             process = processBuilder.start();
             BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
@@ -232,9 +223,10 @@ private static final String DOWNLOAD_DIR =
                 process.destroy();
                 throw new DownloadException("yt-dlp command timed out after " + PROCESS_TIMEOUT + " seconds");
             }
+
             int exitCode = process.exitValue();
             if (exitCode != 0) {
-                throw new DownloadException("yt-dlp failed with exit code: " + exitCode);
+                throw new DownloadException("yt-dlp failed with exit code: " + exitCode+ ". Output: " + jsonOutput.toString());
             }
 
             if (jsonOutput.length() == 0) {
@@ -247,6 +239,10 @@ private static final String DOWNLOAD_DIR =
                 process.destroyForcibly();
             }
             throw new DownloadException("Failed to execute yt-dlp command: " + e.getMessage(), e);
+        }finally {
+            if (process != null) {
+                process.destroy();
+            }
         }
     }
     private VideoInfo parseYtDlpJsonOutput(String jsonOutput){
@@ -407,7 +403,6 @@ private static final String DOWNLOAD_DIR =
     public boolean testYtDlpWithSimpleVideo() {
         Process process = null;
         try {
-            // Test with a known working YouTube video
             String testUrl = "https://youtu.be/1sRaLqtHXQU?si=dONkHZ3gfDhDsFdY"; // First YouTube video
 
             ProcessBuilder processBuilder = new ProcessBuilder(
@@ -451,7 +446,6 @@ private static final String DOWNLOAD_DIR =
     }
     private DownloadProgress parseProgressLine(String line) {
         try {
-            // Example line: "[download]  25.5% of ~  45.21MiB at  1.34MiB/s ETA 00:45"
             if (line.contains("[download]") && line.contains("%")) {
                 Pattern pattern = Pattern.compile(
                         "\\[download\\]\\s+(\\d+\\.?\\d*)%\\s+of\\s+~?\\s*[\\d\\.,]+[KMG]?i?B?\\s+at\\s+([\\d\\.,]+[KMG]?i?B/s)\\s+ETA\\s+([\\d:]+|Unknown)"

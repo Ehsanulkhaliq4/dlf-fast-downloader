@@ -33,6 +33,8 @@ public class DownloadController {
     // Store active downloads
     private final ConcurrentHashMap<String, CompletableFuture<File>> activeDownloads = new ConcurrentHashMap<>();
 
+    private VideoInfo videoInfo = new VideoInfo();
+
 
     @GET
     @Path("/health")
@@ -50,10 +52,8 @@ public class DownloadController {
     @GET
     @Path("/info")
     public void getVideoInfo(@QueryParam("url") String url , @Suspended final AsyncResponse asyncResponse) {
-        // Reuse your existing logic in a thread
         new Thread(() -> {
             try {
-                // Your original code here
                 boolean ytDlpWorking = downloadService.testYtDlpWithSimpleVideo();
                 if (!ytDlpWorking) {
                     asyncResponse.resume(Response.status(Response.Status.INTERNAL_SERVER_ERROR)
@@ -62,7 +62,7 @@ public class DownloadController {
                     return;
                 }
 
-                VideoInfo videoInfo = downloadService.getVideoInfo(url);
+                videoInfo = downloadService.getVideoInfo(url);
                 asyncResponse.resume(Response.ok(videoInfo).build());
             } catch (Exception e) {
                 asyncResponse.resume(Response.status(Response.Status.INTERNAL_SERVER_ERROR)
@@ -85,13 +85,11 @@ public class DownloadController {
     public Response downloadVideo(DownloadRequest request){
         try {
             String downloadId = UUID.randomUUID().toString();
-            // Start download asynchronously
             CompletableFuture<File> downloadFuture = downloadService.downloadVideo(
                     request.getUrl(),
                     request.getFormatId(),
                     downloadId
             );
-            // Store the future for potential cancellation
             activeDownloads.put(downloadId, downloadFuture);
             // Clean up when completed
             downloadFuture.whenComplete((result, throwable) -> {
@@ -122,12 +120,10 @@ public class DownloadController {
                       .entity("{\"error\": \"Download not found\"}")
                       .build();
           }
-          // Clean up completed downloads after some time
           if (progress.getPercentage() >= 100 &&
                   System.currentTimeMillis() - progress.getLastUpdate() > 30000) { // 30 seconds
               progressService.removeProgress(downloadId);
           }
-
           return Response.ok(progress).build();
       }catch (Exception e){
           return Response.status(Response.Status.INTERNAL_SERVER_ERROR)
